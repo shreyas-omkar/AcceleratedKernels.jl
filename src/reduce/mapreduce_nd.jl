@@ -11,7 +11,7 @@
 #   3. Three work decompositions, chosen by the relative sizes of the output and the reduction:
 #        - by_thread:  one thread per output (many outputs, small reduction)
 #        - by_block:   one block per output  (few outputs, large reduction)
-#        - multigroup: several blocks per output, two-pass (very few outputs, huge reduction)
+#        - semaphore: several blocks per output, single-pass with atomic last-block combine
 
 # Number of first-pass blocks the multi-group reduction aims to launch, so a reduction with
 # very few output elements can still fill the GPU. A heuristic GPU-occupancy target; the
@@ -64,7 +64,6 @@ function mapreduce_nd(
     # GPU settings
     block_size::Int,
     temp::Union{Nothing, AbstractArray},
-    temp2::Union{Nothing, AbstractArray}=nothing,  # pre-allocated scratch for multi-group partial
 )
     @argcheck 1 <= block_size <= 1024
 
@@ -160,22 +159,16 @@ function mapreduce_nd(
     end
 
     if reduce_groups > 1
-        partial = _alloc_or_temp2(backend, temp2, init, dst_size, reduce_groups)
+        partial   = KernelAbstractions.allocate(backend, typeof(neutral), (dst_size, reduce_groups))
+        semaphore = KernelAbstractions.allocate(backend, Int32, (dst_size,))
+        fill!(semaphore, Int32(0))
 
-        kernel! = _mapreduce_nd_multigroup!(backend, block_size)
+        kernel! = _mapreduce_nd_semaphore!(backend, block_size)
         kernel!(
-            src, partial, f, op, neutral,
+            src, partial, dst, semaphore, f, op, init, neutral,
             outer_strides, outer_sizes, reduce_strides, reduce_sizes, reduce_calc,
             dst_size, reduce_size, reduce_groups,
             ndrange=(block_size * dst_size * reduce_groups,),
-        )
-
-        # Second pass: reduce partial (dst_size × reduce_groups) → dst, one block per output
-        kernel2! = _mapreduce_partial_to_dst!(backend, block_size)
-        kernel2!(
-            partial, dst, op, init, neutral,
-            dst_size, reduce_groups,
-            ndrange=(block_size * dst_size,),
         )
     elseif dst_size >= reduce_size
         # Many outputs, small reduction: one thread per output reduces sequentially
@@ -211,13 +204,6 @@ function _alloc_or_temp(backend, temp, init, sizes)
     temp
 end
 
-function _alloc_or_temp2(backend, temp2, init, dst_size, reduce_groups)
-    isnothing(temp2) && return KernelAbstractions.allocate(backend, typeof(init), (dst_size, reduce_groups))
-    @argcheck get_backend(temp2) == backend
-    @argcheck length(temp2) >= dst_size * reduce_groups
-    @argcheck eltype(temp2) == typeof(init)
-    reshape(temp2, dst_size, reduce_groups)
-end
 
 # CPU path
 
@@ -432,13 +418,14 @@ end
     end
 end
 
-# GPU kernel: multi-group first pass — several blocks per output element. Block `iblock`
-# handles output `iout` and group `igroup`, reducing its interleaved slice of the reduction
-# into partial[iout, igroup]. The second pass combines the groups.
+# GPU kernel: semaphore single-pass multigroup reduction.
+# Each block reduces its slice into partial[iout, igroup], then thread 0 atomically
+# increments semaphore[iout]. The last block (prev+1==reduce_groups) reads all partials
+# and writes directly to dst. No second kernel launch, no host round-trip.
 
-@kernel inbounds=true cpu=false unsafe_indices=true function _mapreduce_nd_multigroup!(
-    @Const(src), partial,
-    f, op, neutral,
+@kernel inbounds=true cpu=false unsafe_indices=true function _mapreduce_nd_semaphore!(
+    @Const(src), partial, dst, semaphore,
+    f, op, init, neutral,
     outer_strides, outer_sizes,
     reduce_strides, reduce_sizes, reduce_calc,
     output_size, reduce_size, reduce_groups,
@@ -469,38 +456,14 @@ end
 
     if ithread == 0x0
         partial[iout + igroup * output_size + 0x1] = sdata[0x1]
-    end
-end
-
-# GPU kernel: multi-group second pass — One block per output reduces over the `reduce_groups`
-# partials and folds in `init`.
-
-@kernel inbounds=true cpu=false unsafe_indices=true function _mapreduce_partial_to_dst!(
-    @Const(partial), dst,
-    op, init, neutral,
-    output_size, reduce_groups,
-)
-    @uniform N = @groupsize()[1]
-    sdata = @localmem eltype(dst) (N,)
-
-    iblock  = @index(Group, Linear) - 0x1
-    ithread = @index(Local, Linear) - 0x1
-
-    if iblock < output_size
-        acc = neutral
-        g = ithread
-        while g < reduce_groups
-            acc = op(acc, partial[iblock + g * output_size + 0x1])
-            g += N
-        end
-
-        sdata[ithread + 0x1] = acc
-        @synchronize()
-
-        @inline reduce_group!(@context, op, sdata, N, ithread)
-
-        if ithread == 0x0
-            dst[iblock + 0x1] = op(init, sdata[0x1])
+        @fence(:sequentially_consistent)
+        prev = @atomic semaphore[iout + 0x1] += Int32(1)
+        if (prev + Int32(1)) == Int32(reduce_groups)
+            result = neutral
+            @inbounds for g in 0:reduce_groups - 1
+                result = op(result, partial[iout + g * output_size + 0x1])
+            end
+            dst[iout + 0x1] = op(init, result)
         end
     end
 end
