@@ -144,6 +144,11 @@ function mapreduce_nd(
     reduce_sizes   = Tuple(s   for (_, s)   in reduce_segs)
     reduce_size    = len
 
+    # Build a host-side OffsetCalculator for multi-segment reduce dimensions.
+    # Single-segment is just j*stride, so we pass nothing and the kernel uses the fast path.
+    reduce_calc = length(reduce_sizes) > 1 ?
+        OffsetCalculator(reduce_sizes, reduce_strides) : nothing
+
     # One block per output (by_block) launches `dst_size` blocks. When there are too few
     # outputs to fill the GPU *and* the reduction is large, split each output's reduction
     # across `reduce_groups` blocks and combine the partials in a cheap second pass. Capping
@@ -159,7 +164,7 @@ function mapreduce_nd(
         kernel! = _mapreduce_nd_multigroup!(backend, block_size)
         kernel!(
             src, partial, f, op, neutral,
-            outer_strides, outer_sizes, reduce_strides, reduce_sizes,
+            outer_strides, outer_sizes, reduce_strides, reduce_sizes, reduce_calc,
             dst_size, reduce_size, reduce_groups,
             ndrange=(block_size * dst_size * reduce_groups,),
         )
@@ -177,7 +182,7 @@ function mapreduce_nd(
         kernel! = _mapreduce_nd_by_thread!(backend, block_size)
         kernel!(
             src, dst, f, op, init,
-            outer_strides, outer_sizes, reduce_strides, reduce_sizes,
+            outer_strides, outer_sizes, reduce_strides, reduce_sizes, reduce_calc,
             dst_size, reduce_size,
             ndrange=(block_size * blocks,),
         )
@@ -186,7 +191,7 @@ function mapreduce_nd(
         kernel! = _mapreduce_nd_by_block!(backend, block_size)
         kernel!(
             src, dst, f, op, init, neutral,
-            outer_strides, outer_sizes, reduce_strides, reduce_sizes,
+            outer_strides, outer_sizes, reduce_strides, reduce_sizes, reduce_calc,
             dst_size, reduce_size,
             ndrange=(block_size * dst_size,),
         )
@@ -228,9 +233,84 @@ function _mapreduce_nd_cpu_sections!(
     dst
 end
 
+# OffsetCalculator — eliminates integer division inside GPU kernels.
+#
+# For each segment of size n, the CPU precomputes (magic64, shift) so the GPU can
+# replace `j ÷ n` with `UInt32((UInt64(j) * magic64) >> (32 + shift))`.
+# This is PyTorch's OffsetCalculator approach (fast_divmod in Reduce.cuh).
+#
+# Algorithm: shift = bit_length(n-1) = ceil(log2(n)) for n > 1.
+#   magic64 = ceil(2^(32+shift) / n)  [stored as UInt64, typically 33 bits]
+#   Then ⌊j * magic64 / 2^(32+shift)⌋ = ⌊j / n⌋ for all 0 ≤ j < 2^32.
+#
+# GPU implementation: UInt64 multiply then 64-bit right-shift. On CUDA/ROCm this
+# lowers to two 32-bit mul.hi/mul.lo instructions; on Metal/oneAPI similarly cheap.
+
+struct FastDivmod
+    magic :: UInt64   # 64-bit multiplier; q = UInt32((UInt64(j)*magic) >> (32+shift))
+    shift :: UInt32   # extra right-shift after mulhi
+    denom :: UInt32   # original denominator (needed for remainder: r = j - q*denom)
+end
+
+"""
+    FastDivmod(n::Integer)
+
+Precompute magic numbers for division and modulo by `n` using only multiplies and shifts.
+`n` must satisfy 2 ≤ n ≤ typemax(UInt32).
+
+Algorithm: pick shift = ceil(log2(n)), magic64 = ceil(2^(32+shift) / n).
+Then q = UInt32((UInt64(j) * magic64) >> (32+shift)), r = j - q*n.
+This matches PyTorch's OffsetCalculator / LLVM's udiv lowering.
+"""
+function FastDivmod(n::Integer)
+    n32 = UInt32(n)
+    n == 1 && return FastDivmod(UInt64(1), UInt32(0), UInt32(1))
+    # shift = bit_length(n-1) = number of bits to represent n-1
+    # Equivalent to ceil(log2(n)) for n > 1
+    shift = UInt32(64 - leading_zeros(UInt64(n32 - 1)))
+    magic64 = (UInt64(1) << (32 + shift) + UInt64(n32) - 1) ÷ UInt64(n32)
+    FastDivmod(magic64, shift, n32)
+end
+
+# Fast quotient and remainder using precomputed 64-bit magic.
+# On CUDA/ROCm/Metal: the 64-bit multiply lowers to a single mul.hi + mul.lo pair.
+@inline function _fast_divmod(j::UInt32, fd::FastDivmod)
+    q = UInt32((UInt64(j) * fd.magic) >> (32 + fd.shift))
+    r = j - q * fd.denom
+    q, r
+end
+
+
+# OffsetCalculator: fixed-size NTuple of (FastDivmod, stride) pairs, N known at compile time.
+# Passed as a single struct into every kernel call, avoiding per-iteration hardware division.
+# The single-segment case bypasses this entirely (just a multiply).
+
+struct OffsetCalculator{N}
+    fds     :: NTuple{N, FastDivmod}
+    strides :: NTuple{N, UInt32}
+end
+
+function OffsetCalculator(sizes::NTuple{N, Int}, strs::NTuple{N, Int}) where N
+    fds  = ntuple(i -> FastDivmod(sizes[i]), N)
+    strd = ntuple(i -> UInt32(strs[i]), N)
+    OffsetCalculator{N}(fds, strd)
+end
+
+@inline function _calc_offset(j::UInt32, calc::OffsetCalculator{N}) where N
+    off = UInt32(0)
+    tmp = j
+    @inbounds for i in 1:N
+        q, r = _fast_divmod(tmp, calc.fds[i])
+        off += r * calc.strides[i]
+        tmp  = q
+    end
+    Int(off)
+end
+
+
 # Index helpers. Both decode a linear index into a byte-offset by walking compile-time-sized
 # segment tuples. The single-segment case (the common one after canonicalization) needs no
-# division; multi-segment falls back to a per-element decode (rare: non-adjacent dim sets).
+# division at all; multi-segment uses fast_divmod (no hardware integer division).
 
 @inline function _outer_decode(tid, outer_strides, outer_sizes)
     isempty(outer_sizes) && return 0
@@ -246,9 +326,10 @@ end
     base
 end
 
+# Legacy scalar fallback (used by _outer_decode multi-segment; outer is decoded once per
+# output element on the host side so a few div/mod there is fine).
 @inline function _reduce_offset(j, reduce_strides, reduce_sizes)
     isempty(reduce_sizes) && return 0
-    # Single segment: j < reduce_size, so the decode is just j * stride — no division.
     length(reduce_sizes) == 1 && return j * reduce_strides[1]
     off = 0
     tmp = j
@@ -261,6 +342,14 @@ end
     off
 end
 
+# Fast path: use OffsetCalculator when there are multiple reduce segments.
+@inline function _reduce_offset_fast(j::UInt32, reduce_strides, reduce_sizes, calc::OffsetCalculator)
+    _calc_offset(j, calc)
+end
+@inline function _reduce_offset_fast(j::UInt32, reduce_strides, reduce_sizes, ::Nothing)
+    _reduce_offset(Int(j), reduce_strides, reduce_sizes)
+end
+
 # GPU kernel: by_thread — one thread per output element, reducing sequentially.
 # Used when there are more output elements than elements in the reduced dimension(s),
 # e.g. reduce(+, rand(3, 1000), dims=1) — only 3 elements to reduce per output.
@@ -269,7 +358,7 @@ end
     @Const(src), dst,
     f, op, init,
     outer_strides, outer_sizes,
-    reduce_strides, reduce_sizes,
+    reduce_strides, reduce_sizes, reduce_calc,
     output_size, reduce_size,
 )
     # NOTE: index calculations use zero-indexing (fewer ops, matches the CUDA / ROCm / oneAPI /
@@ -283,9 +372,11 @@ end
         input_base = _outer_decode(tid, outer_strides, outer_sizes)
 
         res = init
-        for j in 0x0:reduce_size - 0x1
-            off = _reduce_offset(j, reduce_strides, reduce_sizes)
-            res = op(res, f(src[input_base + off + 0x1]))
+        j = UInt32(0)
+        while j < reduce_size
+            off = _reduce_offset_fast(j, reduce_strides, reduce_sizes, reduce_calc)
+            res = op(res, f(src[input_base + off + 1]))
+            j += UInt32(1)
         end
 
         dst[tid + 0x1] = res
@@ -300,7 +391,7 @@ end
     @Const(src), dst,
     f, op, init, neutral,
     outer_strides, outer_sizes,
-    reduce_strides, reduce_sizes,
+    reduce_strides, reduce_sizes, reduce_calc,
     output_size, reduce_size,
 )
     @uniform N = @groupsize()[1]
@@ -314,11 +405,11 @@ end
 
         # Pre-reduce in strides of N (consecutive threads read consecutive elements)
         acc = neutral
-        j   = ithread
+        j   = UInt32(ithread)
         while j < reduce_size
-            off = _reduce_offset(j, reduce_strides, reduce_sizes)
-            acc = op(acc, f(src[input_base + off + 0x1]))
-            j  += N
+            off = _reduce_offset_fast(j, reduce_strides, reduce_sizes, reduce_calc)
+            acc = op(acc, f(src[input_base + off + 1]))
+            j  += UInt32(N)
         end
 
         sdata[ithread + 0x1] = acc
@@ -340,7 +431,7 @@ end
     @Const(src), partial,
     f, op, neutral,
     outer_strides, outer_sizes,
-    reduce_strides, reduce_sizes,
+    reduce_strides, reduce_sizes, reduce_calc,
     output_size, reduce_size, reduce_groups,
 )
     @uniform N = @groupsize()[1]
@@ -355,11 +446,11 @@ end
     input_base = _outer_decode(iout, outer_strides, outer_sizes)
 
     acc = neutral
-    j   = ithread + igroup * N
+    j   = UInt32(ithread + igroup * N)
     while j < reduce_size
-        off = _reduce_offset(j, reduce_strides, reduce_sizes)
-        acc = op(acc, f(src[input_base + off + 0x1]))
-        j  += N * reduce_groups
+        off = _reduce_offset_fast(j, reduce_strides, reduce_sizes, reduce_calc)
+        acc = op(acc, f(src[input_base + off + 1]))
+        j  += UInt32(N * reduce_groups)
     end
 
     sdata[ithread + 0x1] = acc
@@ -372,7 +463,7 @@ end
     end
 end
 
-# GPU kernel: multi-group second pass — one block per output reduces over the `reduce_groups`
+# GPU kernel: multi-group second pass — One block per output reduces over the `reduce_groups`
 # partials and folds in `init`.
 
 @kernel inbounds=true cpu=false unsafe_indices=true function _mapreduce_partial_to_dst!(
