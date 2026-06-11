@@ -182,7 +182,6 @@ function _mapreduce_impl(
     # GPU settings
     block_size::Int=256,
     temp::Union{Nothing, AbstractArray}=nothing,
-    temp2::Union{Nothing, AbstractArray}=nothing,
     switch_below::Int=0,
 )
     if isnothing(dims)
@@ -209,7 +208,7 @@ function _mapreduce_impl(
             init, neutral, dims,
             max_tasks, prefer_threads,
             min_elems, block_size,
-            temp, temp2,
+            temp,
         )
     end
 end
