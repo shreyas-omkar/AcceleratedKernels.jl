@@ -64,6 +64,7 @@ function mapreduce_nd(
     # GPU settings
     block_size::Int,
     temp::Union{Nothing, AbstractArray},
+    temp2::Union{Nothing, AbstractArray}=nothing,  # pre-allocated scratch for multi-group partial
 )
     @argcheck 1 <= block_size <= 1024
 
@@ -159,7 +160,7 @@ function mapreduce_nd(
     end
 
     if reduce_groups > 1
-        partial = KernelAbstractions.allocate(backend, typeof(init), (dst_size, reduce_groups))
+        partial = _alloc_or_temp2(backend, temp2, init, dst_size, reduce_groups)
 
         kernel! = _mapreduce_nd_multigroup!(backend, block_size)
         kernel!(
@@ -208,6 +209,14 @@ function _alloc_or_temp(backend, temp, init, sizes)
     @argcheck size(temp) == sizes
     @argcheck eltype(temp) == typeof(init)
     temp
+end
+
+function _alloc_or_temp2(backend, temp2, init, dst_size, reduce_groups)
+    isnothing(temp2) && return KernelAbstractions.allocate(backend, typeof(init), (dst_size, reduce_groups))
+    @argcheck get_backend(temp2) == backend
+    @argcheck length(temp2) >= dst_size * reduce_groups
+    @argcheck eltype(temp2) == typeof(init)
+    reshape(temp2, dst_size, reduce_groups)
 end
 
 # CPU path
