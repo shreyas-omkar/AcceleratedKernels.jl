@@ -15,6 +15,7 @@ using ArgCheck: @argcheck
 using GPUArraysCore: AnyGPUArray, @allowscalar
 using KernelAbstractions
 using KernelAbstractions: @context
+import KernelAbstractions.KernelIntrinsics as KI
 import UnsafeAtomics
 
 

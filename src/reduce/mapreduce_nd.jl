@@ -676,17 +676,20 @@ end
 end
 
 # GPU kernel: by_block (contiguous) — each block reduces one stride-1 output element,
-# loading 4 consecutive source elements per thread per loop iteration.
+# loading 4 source elements per thread per loop iteration via KI.vload.
 #
-# Why 4 scalar reads without @Const:
-#   LLVM's LoadStoreVectorizer (LSV) merges consecutive plain `load` instructions into
-#   a single 128-bit vector load: `ld.global.v4.f32` on CUDA, `global_load_dwordx4`
-#   on AMDGPU, etc. @Const wraps loads in backend-specific named intrinsics
-#   (llvm.nvvm.ldg.* on CUDA) which LSV cannot merge — @Const gives LDG but NOT
-#   vector width. Plain loads give vector width.
+# KI.vload(Val(4), src, idx) reinterprets the element pointer as an NTuple{4,VecElement{T}}
+# pointer (LLVM type <4 x T>) and issues a single unsafe_load. The GPU backend lowers
+# that directly to a 128-bit vector instruction — ld.global.v4.f32 on CUDA,
+# global_load_dwordx4 on AMDGPU — with no reliance on the LoadStoreVectorizer pass.
 #
-# Host gates this path on: stride-1 reduction, 4-byte element type, 16-byte-aligned
-# boundaries (base_offset % 4 == 0, outer_strides[1] % 4 == 0).
+# src must NOT be @Const: @Const wraps the array so that indexing uses backend-specific
+# read-only cache intrinsics (ldg on CUDA). KI.vload calls pointer(src, idx) to get
+# the raw global-memory address; a @Const-wrapped array may not expose that correctly,
+# and mixing ldg intrinsics with <4 x T> vector loads would be semantically inconsistent.
+#
+# Host gates this path on: stride-1 reduction, 4-byte element type, isprimitivetype(T),
+# and 16-byte-aligned boundaries (base_offset % 4 == 0, outer_strides[1] % 4 == 0).
 @kernel inbounds=true cpu=false unsafe_indices=true function _mapreduce_nd_by_block_contiguous!(
     src, dst,
     f, op, init, neutral,
@@ -708,14 +711,9 @@ end
         j4      = UInt32(ithread) * UInt32(4)
         stride4 = UInt32(N) * UInt32(4)
         while j4 + UInt32(3) < rs
-            v0 = src[input_base + j4 + 1]
-            v1 = src[input_base + j4 + 2]
-            v2 = src[input_base + j4 + 3]
-            v3 = src[input_base + j4 + 4]
-            acc = op(acc, f(v0))
-            acc = op(acc, f(v1))
-            acc = op(acc, f(v2))
-            acc = op(acc, f(v3))
+            v0, v1, v2, v3 = KI.vload(Val(4), src, input_base + j4 + 1)
+            acc = op(acc, f(v0)); acc = op(acc, f(v1))
+            acc = op(acc, f(v2)); acc = op(acc, f(v3))
             j4 += stride4
         end
         while j4 < rs
