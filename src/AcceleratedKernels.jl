@@ -15,10 +15,6 @@ using ArgCheck: @argcheck
 using GPUArraysCore: AnyGPUArray, @allowscalar
 using KernelAbstractions
 using KernelAbstractions: @context
-# KernelAbstractions.KernelIntrinsics provides backend-agnostic subgroup (warp/wavefront)
-# primitives: shfl_down, get_sub_group_{local_id,id,size}, sub_group_size, etc.
-# Requires KernelAbstractions with subgroup support (PR #668, targeting KA 0.10).
-import KernelAbstractions.KernelIntrinsics as KI
 import UnsafeAtomics
 
 

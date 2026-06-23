@@ -268,17 +268,15 @@ function mapreduce_nd(
         # Contiguous fast path: stride-1 reduction over 4-byte elements with 16-byte
         # aligned boundaries. Rewrites the per-thread loop from 1 strided read per
         # iteration to 4 consecutive reads, which LLVM's LoadStoreVectorizer merges
-        # into a single 128-bit load. Also uses subgroup shuffle reduction (KA PR #668)
-        # instead of the shared-memory tree, cutting barriers from ceil(log2(N)) to 1.
-        # Requires at least one full subgroup (block_size >= KI.sub_group_size).
+        # into a single 128-bit load (ld.global.v4.f32 on CUDA). @Const is intentionally
+        # omitted: it wraps loads in named LDG intrinsics that LSV cannot merge.
         _vl_outer_aligned = isempty(outer_strides) ||
                             (length(outer_strides) == 1 && outer_strides[1] % 4 == 0)
         use_contiguous = (
             length(reduce_strides) == 1 && reduce_strides == (1,) &&
             sizeof(eltype(buffer)) == 4 &&
             base_offset % 4 == 0 &&
-            _vl_outer_aligned &&
-            block_size >= KI.sub_group_size(backend)
+            _vl_outer_aligned
         )
 
         if use_contiguous
@@ -677,58 +675,6 @@ end
     end
 end
 
-# Block-wide reduction using subgroup (warp/wavefront) shuffle operations.
-# Requires KA.KernelIntrinsics (KA PR #668).
-#
-# Reduces sdata[1..N] so sdata[1] holds the block result.
-# Two sync points total: one @synchronize() before this is called (in caller) to ensure
-# all thread accumulators are in sdata, and one @synchronize() here after writing warp
-# sums. Contrast with reduce_group! which needs ceil(log2(N)) @synchronize() calls.
-#
-# Assumes N is a power-of-2 multiple of the subgroup size (guaranteed when
-# block_size >= KI.sub_group_size(backend), which the host checks before dispatch).
-@inline function _block_reduce_subgroup!(@context, op, neutral, sdata, N, ithread)
-    sg_lid  = KI.get_sub_group_local_id()  # 1-based lane within subgroup
-    sg_id   = KI.get_sub_group_id()        # 1-based subgroup index in block
-    sg_size = KI.get_sub_group_size()      # 32 on CUDA, 64 on AMDGPU, etc.
-    num_sgs = KI.get_num_sub_groups()      # block_size ÷ sg_size
-
-    # Phase 1: intra-subgroup tree reduction using shfl_down (subgroup-synchronous,
-    # no barrier needed within a subgroup per the KI spec).
-    val    = sdata[ithread + 0x1]
-    offset = UInt32(1)
-    while offset < sg_size
-        val = op(val, KI.shfl_down(val, offset))
-        offset <<= UInt32(1)
-    end
-    # Each subgroup's lane 1 (sg_lid == 1) now holds the subgroup reduction.
-
-    # Phase 2: lane 1 of each subgroup writes its partial sum to sdata[sg_id].
-    # sdata is large enough: N >= num_sgs * sg_size >= num_sgs.
-    if sg_lid == UInt32(1)
-        sdata[sg_id] = val
-    end
-    @synchronize()
-
-    # Phase 3: first subgroup reduces the num_sgs partial sums in sdata[1..num_sgs].
-    # num_sgs <= sg_size (since block_size <= 1024 and sg_size >= 32), so one
-    # subgroup is enough.
-    if sg_id == UInt32(1)
-        val    = sg_lid <= num_sgs ? sdata[sg_lid] : neutral
-        offset = UInt32(1)
-        while offset < num_sgs
-            val = op(val, KI.shfl_down(val, offset))
-            offset <<= UInt32(1)
-        end
-        # Thread 0 (sg_id=1, sg_lid=1) writes the final block result to sdata[1].
-        # No extra @synchronize() needed: only thread 0 reads sdata[1] in the caller.
-        if sg_lid == UInt32(1)
-            sdata[0x1] = val
-        end
-    end
-    return
-end
-
 # GPU kernel: by_block (contiguous) — each block reduces one stride-1 output element,
 # loading 4 consecutive source elements per thread per loop iteration.
 #
@@ -736,15 +682,11 @@ end
 #   LLVM's LoadStoreVectorizer (LSV) merges consecutive plain `load` instructions into
 #   a single 128-bit vector load: `ld.global.v4.f32` on CUDA, `global_load_dwordx4`
 #   on AMDGPU, etc. @Const wraps loads in backend-specific named intrinsics
-#   (llvm.nvvm.ldg.* on CUDA) which the LSV cannot merge — @Const gives LDG but NOT
-#   vector width. Plain loads give vector width (and the L2 reuse benefit when the
-#   reduction is large enough to exceed the texture cache anyway).
-#
-# Uses _block_reduce_subgroup! (KA PR #668) for the reduction: subgroup shuffle instead
-# of shared-memory tree, cutting barriers from ceil(log2(N)) to 1.
+#   (llvm.nvvm.ldg.* on CUDA) which LSV cannot merge — @Const gives LDG but NOT
+#   vector width. Plain loads give vector width.
 #
 # Host gates this path on: stride-1 reduction, 4-byte element type, 16-byte-aligned
-# boundaries, and block_size >= KI.sub_group_size(backend) (at least one full subgroup).
+# boundaries (base_offset % 4 == 0, outer_strides[1] % 4 == 0).
 @kernel inbounds=true cpu=false unsafe_indices=true function _mapreduce_nd_by_block_contiguous!(
     src, dst,
     f, op, init, neutral,
@@ -784,7 +726,7 @@ end
         sdata[ithread + 0x1] = acc
         @synchronize()
 
-        @inline _block_reduce_subgroup!(@context, op, neutral, sdata, N, ithread)
+        @inline reduce_group!(@context, op, sdata, N, ithread)
 
         if ithread == 0x0
             dst[iout + 0x1] = op(init, sdata[0x1])
