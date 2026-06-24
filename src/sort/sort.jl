@@ -208,10 +208,15 @@ function _sortperm_impl!(
     temp::Union{Nothing, AbstractArray}=nothing,
 )
     if use_gpu_algorithm(backend, prefer_threads)
-        merge_sortperm_lowmem!(
+        # merge_sortperm! copies keys alongside indices in shared memory so comparisons
+        # never touch global memory during the binary-search step.
+        # merge_sortperm_lowmem! avoids the key copy but its comparator does two global
+        # loads per comparison, making it O(n log²n) in global traffic at large n.
+        merge_sortperm!(
             ix, v, backend;
             lt, by, rev, order,
-            block_size, temp,
+            block_size,
+            temp_ix=temp,   # old `temp` was the index buffer; maps directly to temp_ix
         )
     else
         sample_sortperm!(

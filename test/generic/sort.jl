@@ -453,3 +453,116 @@ end
     vh = Array(v)
     @test issorted(vh[ixh])
 end
+
+
+if !IS_CPU_BACKEND || !prefer_threads
+@testset "sortperm_extended" begin
+    # Helper: ix is a valid permutation of 1:n that produces a sorted order
+    function is_valid_perm(vh, ixh; kwargs...)
+        n = length(vh)
+        length(ixh) == n &&
+        sort(Int.(ixh)) == collect(1:n) &&
+        issorted(vh[ixh]; kwargs...)
+    end
+
+    # ── Element types ────────────────────────────────────────────────────────
+    Random.seed!(123)
+
+    for T in (Int16, UInt16, Int64, UInt64, Float64, UInt8)
+        for _ in 1:50
+            n  = rand(1:50_000)
+            v  = array_from_host(rand(T, n))
+            ix = array_from_host(zeros(Int, n))
+            AK.sortperm!(ix, v)
+            vh, ixh = Array(v), Array(ix)
+            @test is_valid_perm(vh, ixh)
+        end
+    end
+
+    # ── Edge sizes ───────────────────────────────────────────────────────────
+    for n in (1, 2, 3, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049)
+        v  = array_from_host(rand(Float32, n))
+        ix = array_from_host(zeros(Int, n))
+        AK.sortperm!(ix, v)
+        vh, ixh = Array(v), Array(ix)
+        @test is_valid_perm(vh, ixh)
+    end
+
+    # ── Data distributions ───────────────────────────────────────────────────
+    n = 2^14
+    Random.seed!(456)
+    base = rand(Float32, n)
+
+    for arr in (
+        sort(base),                                # already sorted
+        reverse(sort(base)),                       # reverse sorted
+        fill(1f0, n),                              # all same
+        Float32.(rand(1:4, n)),                    # 4 unique values
+    )
+        v  = array_from_host(arr)
+        ix = array_from_host(zeros(Int, n))
+        AK.sortperm!(ix, v)
+        vh, ixh = Array(v), Array(ix)
+        @test is_valid_perm(vh, ixh)
+    end
+
+    # ── Comparator options ───────────────────────────────────────────────────
+    n = 10_000
+    Random.seed!(789)
+
+    for (kw, check_kw) in (
+        ((rev=true,),          (rev=true,)),
+        ((by=abs,),            (by=abs,)),
+        ((by=abs, rev=true),   (by=abs, rev=true)),
+        ((lt=(>),),            (lt=(>),)),
+    )
+        v  = array_from_host(randn(Float32, n))
+        ix = array_from_host(zeros(Int, n))
+        AK.sortperm!(ix, v; kw...)
+        vh, ixh = Array(v), Array(ix)
+        @test is_valid_perm(vh, ixh; check_kw...)
+    end
+
+    # ── temp kwarg: buffer reuse gives identical result ───────────────────────
+    n = 20_000
+    Random.seed!(321)
+    v1   = array_from_host(rand(Float32, n))
+    v2   = copy(v1)
+    ix1  = array_from_host(zeros(Int, n))
+    ix2  = array_from_host(zeros(Int, n))
+    temp = array_from_host(zeros(Int, n))
+    AK.sortperm!(ix1, v1; temp)
+    AK.sortperm!(ix2, v2; temp)
+    @test Array(ix1) == Array(ix2)
+
+    # ── Exact match against Base.sortperm ────────────────────────────────────
+    for T in (Int32, Float32, Float64)
+        n   = 10_000
+        v_h = rand(T, n)
+        ref = sortperm(v_h)
+        v   = array_from_host(v_h)
+        ix  = array_from_host(zeros(Int, n))
+        AK.sortperm!(ix, v)
+        ixh = Int.(Array(ix))
+        @test v_h[ixh] == v_h[ref]
+    end
+
+    # ── Stability: equal keys must preserve original relative order ───────────
+    n   = 10_000
+    v_h = Int32.(mod.(1:n, 10))   # values 0..9 cycling, 1000 of each
+    v   = array_from_host(v_h)
+    ix  = array_from_host(zeros(Int, n))
+    AK.sortperm!(ix, v)
+    ixh = Array(ix)
+    for k in 0:9
+        group = ixh[v_h[ixh] .== k]
+        @test issorted(group)   # within each equal-key group, indices must be ascending
+    end
+
+    # ── sortperm does not mutate the input ───────────────────────────────────
+    v    = array_from_host(rand(Float32, 5_000))
+    vbak = copy(v)
+    AK.sortperm(v)
+    @test Array(v) == Array(vbak)
+end
+end
