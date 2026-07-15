@@ -246,6 +246,187 @@ end
 end
 
 
+# ─── Onesweep (experimental) ─────────────────────────────────────────────────
+# Fuses the global prefix-sum into the scatter, cutting the per-pass kernel launches from
+# hist + accumulate!(scan) + scatter down to hist + tiny-scan + scatter — a win on
+# dispatch-bound backends (e.g. Metal).  Opt-in via ENV["AK_RADIX_ONESWEEP"]; needs shared-
+# and global-memory atomics plus a device-scope fence, so the driver only selects it where
+# the backend reports atomics support.  Per pass:
+#   1. _radix_hist_os!  — per-tile digit histogram AND global per-digit totals, one pass.
+#   2. _radix_digit_base! — exclusive scan of the 256 totals → per-digit region base.
+#   3. _radix_scatter_onesweep! — each tile finds its exclusive cross-tile prefix per digit by
+#      a NON-SPINNING decoupled look-back (accumulate predecessors' published counts until an
+#      inclusive aggregate is found; never busy-waits), then scatters.  The look-back only
+#      reads already-computed histogram values, so it always makes progress — no forward-
+#      progress guarantee needed, unlike a spin-based chain (safe on Metal / weaker backends).
+
+# Device-scope fence for the look-back publish/consume.  Generic acquire-release atomic
+# fence lowers on OpenCL/SPIR-V, Metal, oneAPI and AMDGPU; CUDA overrides `_os_fence` with
+# a native threadfence (membar.gl) via the package extension (NVPTX does not select scoped
+# atomic fences).  `incl`/`flags` are integer, so relaxed atomic load/store need no reinterpret.
+@inline _os_fence() = UnsafeAtomics.fence(UnsafeAtomics.acq_rel)
+@inline _os_load(a, i) = UnsafeAtomics.load(pointer(a, i), UnsafeAtomics.monotonic)
+@inline function _os_store!(a, i, x)
+    UnsafeAtomics.store!(pointer(a, i), x, UnsafeAtomics.monotonic)
+    nothing
+end
+
+
+# Per-tile digit histogram hist[d*num_blocks+b] plus global per-digit totals digit_total[d],
+# in a single pass over the data (shared-mem atomic tile histogram; global atomic to totals).
+@kernel inbounds=true cpu=false unsafe_indices=true function _radix_hist_os!(
+    hist, digit_total, @Const(v), shift::UInt32, rev::Bool,
+)
+    @uniform NI = Int(@groupsize()[1])
+    s_hist = @localmem UInt32 (Int(_RS_SIZE),)
+
+    iblock  = Int(@index(Group, Linear)) - 1
+    ithread = Int(@index(Local, Linear)) - 1
+    len        = Int(length(v))
+    num_blocks = Int(length(hist)) ÷ Int(_RS_SIZE)
+
+    j = ithread
+    while j < Int(_RS_SIZE)
+        s_hist[j + 1] = UInt32(0)
+        j += NI
+    end
+    @synchronize()
+
+    i = iblock * NI + ithread
+    if i < len
+        d = Int(_rs_digit(v[i + 1], shift, rev))
+        Atomix.@atomic s_hist[d + 1] += UInt32(1)
+    end
+    @synchronize()
+
+    j = ithread
+    while j < Int(_RS_SIZE)
+        c = s_hist[j + 1]
+        hist[j * num_blocks + iblock + 1] = c
+        if c != UInt32(0)
+            Atomix.@atomic digit_total[j + 1] += c
+        end
+        j += NI
+    end
+end
+
+
+# Exclusive scan of the 256 digit totals → digit_base[d] = start offset of digit d's region.
+# Single block; the 256-element serial scan by one thread is negligible (≤8 passes total).
+@kernel inbounds=true cpu=false unsafe_indices=true function _radix_digit_base!(
+    digit_base, @Const(digit_total),
+)
+    ithread = Int(@index(Local, Linear)) - 1
+    if ithread == 0
+        acc = UInt32(0)
+        for d in 1:Int(_RS_SIZE)
+            digit_base[d] = acc
+            acc += digit_total[d]
+        end
+    end
+end
+
+
+# Fused onesweep scatter with a NON-SPINNING decoupled look-back.  `incl`/`flags` are length
+# 256*num_blocks (per tile, per digit); `flags` must be zero-initialised before launch.  `incl`
+# needs no init: a consumer only reads incl[b',d] after observing flags[b',d] == 1, set after
+# the write to incl[b',d].
+#
+# For its digit d, tile b walks predecessors b-1, b-2, …: if a predecessor has published its
+# inclusive aggregate (flag == 1) we add it and stop; otherwise we add that predecessor's plain
+# (already-computed) tile count `hist[d,b']` and keep walking.  Because `hist` is fully computed
+# by _radix_hist_os! before this kernel, the walk ALWAYS makes progress and never busy-waits, so
+# no cross-block forward-progress guarantee is required (safe on Metal).
+@kernel inbounds=true cpu=false unsafe_indices=true function _radix_scatter_onesweep!(
+    v_out, @Const(v_in), @Const(hist), @Const(digit_base), incl, flags,
+    shift::UInt32, rev::Bool,
+)
+    @uniform N   = @groupsize()[1]
+    @uniform NI  = Int(@groupsize()[1])
+    @uniform NCH = Int(@groupsize()[1]) ÷ _RS_CHUNK
+    s_elem  = @localmem eltype(v_in) (N,)
+    s_digit = @localmem UInt32       (N,)
+    s_chist = @localmem UInt32       (256 * NCH,)   # per-chunk digit bases (intra-tile rank)
+    s_gbase = @localmem UInt32       (256,)         # global base per digit for this tile
+
+    iblock  = Int(@index(Group, Linear)) - 1
+    ithread = Int(@index(Local, Linear)) - 1
+    len        = Int(length(v_in))
+    num_blocks = Int(length(flags)) ÷ 256
+
+    i = iblock * NI + ithread
+    if i < len
+        s_elem[ithread + 1] = v_in[i + 1]
+    end
+    j = ithread
+    while j < 256 * NCH
+        s_chist[j + 1] = UInt32(0)
+        j += NI
+    end
+    @synchronize()
+
+    mychunk  = ithread ÷ _RS_CHUNK
+    my_digit = UInt32(i < len ? _rs_digit(s_elem[ithread + 1], shift, rev) : 0)
+    s_digit[ithread + 1] = my_digit
+    if i < len
+        Atomix.@atomic s_chist[mychunk * 256 + Int(my_digit) + 1] += UInt32(1)
+    end
+    @synchronize()
+
+    # Per digit (thread d owns digit d, d+NI, …): intra-tile cross-chunk exclusive prefix, then
+    # the non-spinning cross-tile look-back for the exclusive per-digit prefix.
+    d = ithread
+    while d < 256
+        # cross-chunk exclusive prefix; `local_count` ends as this tile's total count of digit d
+        local_count = UInt32(0)
+        for c in 0:NCH-1
+            cnt = s_chist[c * 256 + d + 1]
+            s_chist[c * 256 + d + 1] = local_count
+            local_count += cnt
+        end
+
+        # non-spinning decoupled look-back over predecessor tiles for digit d
+        excl_partial = UInt32(0)
+        excl = UInt32(0)
+        found = false
+        b = iblock - 1
+        while b >= 0
+            if _os_load(flags, b * 256 + d + 1) == UInt8(1)
+                _os_fence()                                     # value load after flag load
+                excl = _os_load(incl, b * 256 + d + 1) + excl_partial
+                found = true
+                break
+            else
+                excl_partial += hist[d * num_blocks + b + 1]    # plain count, always available
+            end
+            b -= 1
+        end
+        if !found
+            excl = digit_base[d + 1] + excl_partial
+        end
+
+        _os_store!(incl, iblock * 256 + d + 1, excl + local_count)   # publish inclusive prefix
+        _os_fence()                                                 # value before flag
+        _os_store!(flags, iblock * 256 + d + 1, UInt8(1))
+        s_gbase[d + 1] = excl
+        d += NI
+    end
+    @synchronize()
+
+    # Scatter with the intra-tile chunked stable rank.
+    if i < len
+        chunk_start = mychunk * _RS_CHUNK
+        cnt = UInt32(0)
+        for jj in chunk_start:(ithread - 1)
+            cnt += UInt32(s_digit[jj + 1] == my_digit)
+        end
+        rank = s_chist[mychunk * 256 + Int(my_digit) + 1] + cnt
+        gpos = Int(s_gbase[Int(my_digit) + 1]) + Int(rank)
+        v_out[gpos + 1] = s_elem[ithread + 1]
+    end
+end
+
+
 # ─── Implementation ──────────────────────────────────────────────────────────
 
 _rs_supported(::Type{T}) where T =
@@ -310,14 +491,27 @@ function _radix_sort!(
     num_blocks = cld(n, block_size)
     n_passes   = sizeof(T) * 8 ÷ Int(_RS_BITS)   # 4 for 32-bit, 8 for 64-bit
 
-    # Single histogram buffer; no need to zero before each pass — _radix_hist!
-    # zero-initializes its own shared-memory histogram and writes directly here.
-    hist = similar(v, UInt32, Int(_RS_SIZE) * num_blocks)
+    # Experimental onesweep path (opt-in): fuses the prefix-sum into the scatter.  Needs
+    # shared/global atomics + a device-scope fence, and block_size a multiple of the chunk.
+    has_atomics = KernelAbstractions.supports_atomics(backend)
+    onesweep = haskey(ENV, "AK_RADIX_ONESWEEP") && has_atomics && block_size % _RS_CHUNK == 0
 
-    # Reusable scratch for accumulate!'s per-block prefixes (ScanPrefixes uses a
-    # 256-thread, 2-elems-per-thread grid → 512 elements per block), so the
-    # exclusive prefix sum does not re-allocate on every pass.
-    acc_temp = similar(v, UInt32, cld(length(hist), 512))
+    if onesweep
+        hist        = similar(v, UInt32, Int(_RS_SIZE) * num_blocks)
+        digit_total = similar(v, UInt32, Int(_RS_SIZE))
+        digit_base  = similar(v, UInt32, Int(_RS_SIZE))
+        incl        = similar(v, UInt32, Int(_RS_SIZE) * num_blocks)
+        flags       = similar(v, UInt8,  Int(_RS_SIZE) * num_blocks)
+    else
+        # Single histogram buffer; no need to zero before each pass — the histogram kernel
+        # zero-initializes its own shared-memory histogram and writes directly here.
+        hist = similar(v, UInt32, Int(_RS_SIZE) * num_blocks)
+
+        # Reusable scratch for accumulate!'s per-block prefixes (ScanPrefixes uses a
+        # 256-thread, 2-elems-per-thread grid → 512 elements per block), so the
+        # exclusive prefix sum does not re-allocate on every pass.
+        acc_temp = similar(v, UInt32, cld(length(hist), 512))
+    end
 
     p1 = v
     p2 = if !isnothing(temp)
@@ -338,13 +532,18 @@ function _radix_sort!(
     # where the backend reports atomics support and fall back to the portable
     # scan/broadcast kernels otherwise.  The chunked scatter additionally needs
     # block_size to be a multiple of its 32-wide chunk.
-    has_atomics = KernelAbstractions.supports_atomics(backend)
-    hist_kern! = has_atomics ?
-        _radix_hist_atomic!(backend, block_size) :
-        _radix_hist!(backend, block_size)
-    scat_kern! = (has_atomics && block_size % _RS_CHUNK == 0) ?
-        _radix_scatter_chunked!(backend, block_size) :
-        _radix_scatter!(backend, block_size)
+    if onesweep
+        hist_os_kern! = _radix_hist_os!(backend, block_size)
+        dbase_kern!   = _radix_digit_base!(backend, block_size)
+        os_kern!      = _radix_scatter_onesweep!(backend, block_size)
+    else
+        hist_kern! = has_atomics ?
+            _radix_hist_atomic!(backend, block_size) :
+            _radix_hist!(backend, block_size)
+        scat_kern! = (has_atomics && block_size % _RS_CHUNK == 0) ?
+            _radix_scatter_chunked!(backend, block_size) :
+            _radix_scatter!(backend, block_size)
+    end
 
     n_actual = 0
 
@@ -358,11 +557,21 @@ function _radix_sort!(
         (min_key >> shift) == (max_key >> shift) && continue
 
         shift32 = UInt32(shift)
-        # The three kernels run in order on a single backend stream, so no host
-        # synchronization is needed between them.
-        hist_kern!(hist, p1, shift32, descending; ndrange)
-        accumulate!(+, hist, backend; init=UInt32(0), inclusive=false, temp=acc_temp)
-        scat_kern!(p2, p1, hist, shift32, descending; ndrange)
+        # Kernels run in order on a single backend stream, so no host synchronization is
+        # needed between them.
+        if onesweep
+            # digit_total accumulates via atomics and flags gates the look-back, so both start
+            # zeroed each pass; incl is written before it is read.
+            fill!(digit_total, UInt32(0))
+            fill!(flags, UInt8(0))
+            hist_os_kern!(hist, digit_total, p1, shift32, descending; ndrange)
+            dbase_kern!(digit_base, digit_total; ndrange=(block_size,))
+            os_kern!(p2, p1, hist, digit_base, incl, flags, shift32, descending; ndrange)
+        else
+            hist_kern!(hist, p1, shift32, descending; ndrange)
+            accumulate!(+, hist, backend; init=UInt32(0), inclusive=false, temp=acc_temp)
+            scat_kern!(p2, p1, hist, shift32, descending; ndrange)
+        end
 
         p1, p2 = p2, p1
         n_actual += 1
