@@ -351,16 +351,16 @@ end
     s_part[ithread + 1] = mysum
     @synchronize()
 
-    # Hillis-Steele inclusive scan over the per-thread partials
-    offset = 1
-    while offset < NI
-        val = ithread >= offset ? s_part[ithread - offset + 1] : UInt32(0)
-        @synchronize()
-        s_part[ithread + 1] += val
-        @synchronize()
-        offset <<= 1
+    # Exclusive prefix over the per-thread partials.  Computed redundantly by every thread
+    # from the already-synchronized s_part rather than scanned in place: an in-place scan
+    # rewrites s_part while other threads still read it, and the extra barriers that would
+    # need are not worth it for _RS_SIZE/block_size partials.
+    mybase = UInt32(0)
+    q = 0
+    while q < ithread
+        mybase += s_part[q + 1]
+        q += 1
     end
-    mybase = ithread == 0 ? UInt32(0) : s_part[ithread]      # exclusive for this thread's run
 
     # Turn the per-digit block totals into block-local exclusive offsets
     acc = mybase
