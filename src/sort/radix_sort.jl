@@ -48,7 +48,8 @@ const _RS_SHMEM_BUDGET = 48 * 1024
     nchunks = block_size ÷ _RS_CHUNK
     elems   = block_size * sizeof(T)                    # s_out
     u32s    = block_size * 2 + Int(_RS_SIZE) * 2 +      # s_digit, s_part, s_gbase, s_dbase
-              Int(_RS_SIZE) * nchunks                   # s_chist
+              Int(_RS_SIZE) * nchunks +                 # s_chist
+              nchunks                                   # s_seg
     elems + u32s * sizeof(UInt32)
 end
 
@@ -284,6 +285,17 @@ end
 # position is then s_dbase[digit] + rank-within-digit, and its global destination is
 # s_gbase[digit] + (block-local position - s_dbase[digit]).
 
+# !!! WARNING: NOT CURRENTLY SELECTED -- races on Intel/oneAPI.
+#
+# This kernel is ~10% faster than the chunked scatter on CUDA (n=16M: Int64 total 49.6 -> 41.6 ms)
+# and passes 352/352 there including 150 stress repeats, but it returns a mostly-unsorted array on
+# roughly 1 run in 5 on Intel Iris Xe at n=262144, while _radix_scatter_chunked! is clean 10/10 on
+# the same device.  The hazard was not isolated: an in-place Hillis-Steele prefix, a fully serial
+# prefix, a two-level prefix with uniform control flow, and a statically sized segment buffer all
+# still reproduced it, so it is not simply the cross-digit scan.  Kept here because the coalesced
+# write-out is the right idea (it removes ~4x write amplification) and the remaining bug is
+# believed to be in the block-local reorder, not the approach.  Do not select it until a run of
+# several hundred iterations on a SPIR-V backend is clean.
 @kernel inbounds=true cpu=false unsafe_indices=true function _radix_scatter_coalesced!(
     v_out, @Const(v_in), @Const(hist), shift::UInt32, rev::Bool,
 )
@@ -299,6 +311,7 @@ end
     s_dbase = @localmem UInt32       (Int(_RS_SIZE),) # block-local exclusive offset per digit
     s_chist = @localmem UInt32       (Int(_RS_SIZE) * NCH,)
     s_part  = @localmem UInt32       (N,)             # partials for the cross-digit scan
+    s_seg   = @localmem UInt32       (32,)            # per-segment totals of s_part (block_size<=1024 => NCH<=32)
 
     iblock  = Int(@index(Group, Linear)) - 1
     ithread = Int(@index(Local, Linear)) - 1
@@ -351,12 +364,36 @@ end
     s_part[ithread + 1] = mysum
     @synchronize()
 
-    # Exclusive prefix over the per-thread partials.  Computed redundantly by every thread
-    # from the already-synchronized s_part rather than scanned in place: an in-place scan
-    # rewrites s_part while other threads still read it, and the extra barriers that would
-    # need are not worth it for _RS_SIZE/block_size partials.
+    # Two-level exclusive prefix over the per-thread partials.  Neither level ever rewrites a
+    # buffer it also reads — s_part is written once before a barrier and thereafter only read,
+    # and s_seg likewise — so there is none of the read-write hazard that made an in-place
+    # Hillis-Steele scan race on Intel.  Costs NCH + _RS_CHUNK steps per thread instead of the
+    # block_size steps a fully serial prefix takes, using only two barriers: a log-depth scan
+    # would need 2*log2(block_size) of them, and barriers are expensive on backends that map a
+    # 256-thread group onto many narrow sub-groups.
+    # Every thread totals its *own* segment and writes it, so all threads in a segment store
+    # the same value to the same slot — a benign duplicate write.  Restricting this to one
+    # thread per segment would be less work, but it puts the following barrier downstream of
+    # divergent control flow, which is exactly what reintroduced the Intel race; keeping the
+    # path uniform up to the barrier is what makes this safe.
+    myseg = ithread ÷ _RS_CHUNK
+    seg_total = UInt32(0)
+    q = myseg * _RS_CHUNK
+    qend = q + _RS_CHUNK
+    while q < qend
+        seg_total += s_part[q + 1]
+        q += 1
+    end
+    s_seg[myseg + 1] = seg_total
+    @synchronize()
+
     mybase = UInt32(0)
     q = 0
+    while q < myseg                     # whole preceding segments
+        mybase += s_seg[q + 1]
+        q += 1
+    end
+    q = myseg * _RS_CHUNK               # partials within my own segment
     while q < ithread
         mybase += s_part[q + 1]
         q += 1
@@ -698,7 +735,7 @@ function _radix_sort!(
         # portable broadcast scatter rather than emitting a kernel that cannot launch.
         scat_kern! = if has_atomics && block_size % _RS_CHUNK == 0 &&
                         _rs_scatter_shmem(T, block_size) <= _RS_SHMEM_BUDGET
-            _radix_scatter_coalesced!(backend, block_size)
+            _radix_scatter_chunked!(backend, block_size)
         else
             _radix_scatter!(backend, block_size)
         end
