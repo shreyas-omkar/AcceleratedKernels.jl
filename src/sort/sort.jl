@@ -20,15 +20,26 @@ Base.@kwdef struct MergeSort <: SortAlgorithm
 end
 
 """
-    RadixSort()
+    RadixSort(; onesweep=false)
 
 Use GPU radix sort for `sort!` and `sort`. A stable LSD radix sort (8-bit digits) supporting
 32- and 64-bit integers and floats; other element types or custom `lt`/`by` fall back to
 [`merge_sort!`](@ref). It is typically faster than [`MergeSort`](@ref) for these numeric types,
 and skips passes automatically for small-range or structured data. Defaults to `block_size=256`.
 This algorithm does not support `sortperm!`.
+
+`onesweep=true` selects an **experimental** variant that fuses the global prefix-sum into the
+scatter via a non-spinning decoupled look-back, cutting the kernel launches per pass from three
+(histogram, scan, scatter) down to two. This trades more device-memory traffic and a
+cross-block dependency for fewer dispatches, so it is expected to help only on
+dispatch-bound backends (Metal, oneAPI) and to lose on CUDA, where launches are cheap.
+It requires backend atomics support and `block_size % 32 == 0`, and silently falls back to the
+default three-kernel path otherwise. The default can also be flipped for a whole session with
+the `AK_RADIX_ONESWEEP` environment variable.
 """
-struct RadixSort <: SortAlgorithm end
+Base.@kwdef struct RadixSort <: SortAlgorithm
+    onesweep::Bool = haskey(ENV, "AK_RADIX_ONESWEEP")
+end
 
 """
     SampleSort()
@@ -160,6 +171,7 @@ function _sort_impl!(
                 lt, by, rev, order,
                 block_size=isnothing(block_size) ? 256 : block_size,
                 temp,
+                onesweep=alg.onesweep,
             )
         else
             throw(ArgumentError("$(typeof(alg)) is not supported by sort! on GPU backends"))

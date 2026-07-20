@@ -470,6 +470,7 @@ function _radix_sort!(
     order::Base.Order.Ordering=Base.Forward,
     block_size::Int=256,
     temp::Union{Nothing, AbstractArray}=nothing,
+    onesweep::Bool=haskey(ENV, "AK_RADIX_ONESWEEP"),
 ) where T
 
     if !_rs_supported(T) || lt !== isless || by !== identity
@@ -488,8 +489,11 @@ function _radix_sort!(
 
     # Experimental onesweep path (opt-in): fuses the prefix-sum into the scatter.  Needs
     # shared/global atomics + a device-scope fence, and block_size a multiple of the chunk.
+    # Requested via the `onesweep` keyword (default: the AK_RADIX_ONESWEEP env var, which lets
+    # a whole test/benchmark run be flipped over without touching call sites); silently
+    # declined where the backend cannot support it.
     has_atomics = KernelAbstractions.supports_atomics(backend)
-    onesweep = haskey(ENV, "AK_RADIX_ONESWEEP") && has_atomics && block_size % _RS_CHUNK == 0
+    onesweep = onesweep && has_atomics && block_size % _RS_CHUNK == 0
 
     if onesweep
         hist        = similar(v, UInt32, Int(_RS_SIZE) * num_blocks)
