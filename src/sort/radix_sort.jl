@@ -246,6 +246,137 @@ end
 end
 
 
+# ─── Phase 3c: scatter — shared-memory reordered, coalesced writes ───────────
+# The chunked scatter above computes the right destination for every element but writes it
+# straight to global memory.  Neighbouring threads in a warp almost always hold different
+# digits, so their destinations are far apart and each element becomes its own memory
+# transaction — for 8-byte keys that is ~4x write amplification, and it dominates the pass.
+#
+# This kernel instead does the reorder in shared memory first (the standard CUB approach):
+# every element is placed at its block-local digit-sorted position in `s_out`, and only then
+# written out.  Because `s_out` is sorted by digit, thread t and thread t+1 usually carry the
+# same digit and therefore land on adjacent global addresses, so the writes coalesce.
+#
+# The extra ingredient over the chunked kernel is `s_dbase`: the block-local exclusive offset
+# of each digit, obtained by scanning the per-digit block totals.  An element's block-local
+# position is then s_dbase[digit] + rank-within-digit, and its global destination is
+# s_gbase[digit] + (block-local position - s_dbase[digit]).
+
+@kernel inbounds=true cpu=false unsafe_indices=true function _radix_scatter_coalesced!(
+    v_out, @Const(v_in), @Const(hist), shift::UInt32, rev::Bool,
+)
+    @uniform N   = @groupsize()[1]
+    @uniform NI  = Int(@groupsize()[1])
+    @uniform NCH = Int(@groupsize()[1]) ÷ _RS_CHUNK   # number of chunks
+    @uniform NDIG = Int(_RS_SIZE)
+    @uniform KPT = cld(Int(_RS_SIZE), Int(@groupsize()[1]))   # digits per thread in the scan
+
+    s_out   = @localmem eltype(v_in) (N,)             # block-local digit-sorted elements
+    s_digit = @localmem UInt32       (N,)
+    s_gbase = @localmem UInt32       (Int(_RS_SIZE),) # global start per digit, for this block
+    s_dbase = @localmem UInt32       (Int(_RS_SIZE),) # block-local exclusive offset per digit
+    s_chist = @localmem UInt32       (Int(_RS_SIZE) * NCH,)
+    s_part  = @localmem UInt32       (N,)             # partials for the cross-digit scan
+
+    iblock  = Int(@index(Group, Linear)) - 1
+    ithread = Int(@index(Local, Linear)) - 1
+    len        = Int(length(v_in))
+    num_blocks = Int(length(hist)) ÷ Int(_RS_SIZE)
+
+    # The element is only ever accessed by its owning thread, so it stays in a register
+    # rather than costing another N-element shared-memory buffer.
+    i = iblock * NI + ithread
+    my_elem = i < len ? v_in[i + 1] : zero(eltype(v_in))
+
+    j = ithread
+    while j < NDIG
+        s_gbase[j + 1] = hist[j * num_blocks + iblock + 1]
+        j += NI
+    end
+    j = ithread
+    while j < NDIG * NCH
+        s_chist[j + 1] = UInt32(0)
+        j += NI
+    end
+    @synchronize()
+
+    mychunk  = ithread ÷ _RS_CHUNK
+    my_digit = UInt32(i < len ? _rs_digit(my_elem, shift, rev) : 0)
+    s_digit[ithread + 1] = my_digit
+    if i < len
+        Atomix.@atomic s_chist[mychunk * NDIG + Int(my_digit) + 1] += UInt32(1)
+    end
+    @synchronize()
+
+    # Cross-chunk exclusive prefix per digit, capturing each digit's block total in s_dbase.
+    # Digits are handed out in contiguous runs (not strided) so the two-level scan below can
+    # treat each thread's run as one segment.
+    dlo = ithread * KPT
+    dhi = min(NDIG, dlo + KPT)
+    mysum = UInt32(0)
+    d = dlo
+    while d < dhi
+        acc = UInt32(0)
+        for c in 0:NCH - 1
+            cnt = s_chist[c * NDIG + d + 1]
+            s_chist[c * NDIG + d + 1] = acc
+            acc += cnt
+        end
+        s_dbase[d + 1] = acc        # block total for this digit, scanned in place below
+        mysum += acc
+        d += 1
+    end
+    s_part[ithread + 1] = mysum
+    @synchronize()
+
+    # Hillis-Steele inclusive scan over the per-thread partials
+    offset = 1
+    while offset < NI
+        val = ithread >= offset ? s_part[ithread - offset + 1] : UInt32(0)
+        @synchronize()
+        s_part[ithread + 1] += val
+        @synchronize()
+        offset <<= 1
+    end
+    mybase = ithread == 0 ? UInt32(0) : s_part[ithread]      # exclusive for this thread's run
+
+    # Turn the per-digit block totals into block-local exclusive offsets
+    acc = mybase
+    d = dlo
+    while d < dhi
+        t = s_dbase[d + 1]
+        s_dbase[d + 1] = acc
+        acc += t
+        d += 1
+    end
+    @synchronize()
+
+    # Place each element at its block-local digit-sorted slot.  Threads whose element is out
+    # of range never wrote a count, so the valid elements fill exactly [0, nvalid).
+    if i < len
+        chunk_start = mychunk * _RS_CHUNK
+        cnt = UInt32(0)
+        for jj in chunk_start:(ithread - 1)
+            cnt += UInt32(s_digit[jj + 1] == my_digit)
+        end
+        rank_in_digit = s_chist[mychunk * NDIG + Int(my_digit) + 1] + cnt
+        s_out[Int(s_dbase[Int(my_digit) + 1]) + Int(rank_in_digit) + 1] = my_elem
+    end
+    @synchronize()
+
+    # Coalesced write-out: s_out is digit-sorted, so consecutive threads within a digit run
+    # write consecutive global addresses.  The digit is recomputed rather than stored, which
+    # is cheaper than another N-element shared buffer.
+    nvalid = len - iblock * NI
+    nvalid = nvalid > NI ? NI : nvalid
+    if ithread < nvalid
+        e = s_out[ithread + 1]
+        d_out = Int(_rs_digit(e, shift, rev))
+        v_out[Int(s_gbase[d_out + 1]) + (ithread - Int(s_dbase[d_out + 1])) + 1] = e
+    end
+end
+
+
 # ─── Onesweep (experimental) ─────────────────────────────────────────────────
 # Fuses the global prefix-sum into the scatter, cutting the per-pass kernel launches from
 # hist + accumulate!(scan) + scatter down to hist + tiny-scan + scatter — a win on
@@ -539,9 +670,16 @@ function _radix_sort!(
         hist_kern! = has_atomics ?
             _radix_hist_atomic!(backend, block_size) :
             _radix_hist!(backend, block_size)
-        scat_kern! = (has_atomics && block_size % _RS_CHUNK == 0) ?
-            _radix_scatter_chunked!(backend, block_size) :
+        # The coalesced scatter reorders through shared memory before writing, which removes
+        # the write amplification of the direct scatter; AK_RADIX_NOCOALESCE selects the older
+        # direct-write kernel for A/B measurement.
+        scat_kern! = if has_atomics && block_size % _RS_CHUNK == 0
+            haskey(ENV, "AK_RADIX_NOCOALESCE") ?
+                _radix_scatter_chunked!(backend, block_size) :
+                _radix_scatter_coalesced!(backend, block_size)
+        else
             _radix_scatter!(backend, block_size)
+        end
     end
 
     n_actual = 0
