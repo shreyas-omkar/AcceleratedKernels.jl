@@ -30,6 +30,21 @@ const _RS_BITS  = UInt32(8)
 const _RS_SIZE  = UInt32(256)   # 2^_RS_BITS
 const _RS_CHUNK = 32            # chunked-scatter chunk width (smaller = cheaper rank; 32 best measured)
 
+# Conservative per-block shared-memory budget.  48 KiB is the largest static allocation every
+# backend we target accepts without opting into a larger carveout, so it is used as a portable
+# ceiling rather than querying a device limit KernelAbstractions cannot yet report.
+const _RS_SHMEM_BUDGET = 48 * 1024
+
+# Shared memory the chunked / coalesced scatter kernels need for a given key type and block
+# size.  Dominated by the per-chunk sub-histogram (_RS_SIZE entries per chunk).
+@inline function _rs_scatter_shmem(::Type{T}, block_size::Integer) where {T}
+    nchunks = block_size ÷ _RS_CHUNK
+    elems   = block_size * sizeof(T)                    # s_out
+    u32s    = block_size * 2 + Int(_RS_SIZE) * 2 +      # s_digit, s_part, s_gbase, s_dbase
+              Int(_RS_SIZE) * nchunks                   # s_chist
+    elems + u32s * sizeof(UInt32)
+end
+
 
 # ─── Make any supported scalar type sortable as an unsigned integer ───────────
 
@@ -670,10 +685,14 @@ function _radix_sort!(
         hist_kern! = has_atomics ?
             _radix_hist_atomic!(backend, block_size) :
             _radix_hist!(backend, block_size)
-        # The coalesced scatter reorders through shared memory before writing, which removes
-        # the write amplification of the direct scatter; AK_RADIX_NOCOALESCE selects the older
-        # direct-write kernel for A/B measurement.
-        scat_kern! = if has_atomics && block_size % _RS_CHUNK == 0
+        # The chunked and coalesced scatters both hold a per-chunk sub-histogram in shared
+        # memory, which grows as block_size * _RS_SIZE and overflows the shared-memory budget
+        # for large blocks with wide keys (e.g. block_size=1024 with 8-byte keys, where the
+        # kernel fails to compile outright).  Estimate the requirement and fall back to the
+        # portable broadcast scatter rather than emitting a kernel that cannot launch.
+        # AK_RADIX_NOCOALESCE selects the older direct-write kernel for A/B measurement.
+        scat_kern! = if has_atomics && block_size % _RS_CHUNK == 0 &&
+                        _rs_scatter_shmem(T, block_size) <= _RS_SHMEM_BUDGET
             haskey(ENV, "AK_RADIX_NOCOALESCE") ?
                 _radix_scatter_chunked!(backend, block_size) :
                 _radix_scatter_coalesced!(backend, block_size)
