@@ -193,6 +193,16 @@ end
     sizeof(T) == 4 ? UInt32 :
     sizeof(T) == 8 ? UInt64 : Nothing
 
+# Reinterpret a device pointer to a same-width unsigned integer *without* dropping its address
+# space. `reinterpret(Ptr{U}, p)` yields a generic (addrspace 0) pointer, and SPIR-V permits
+# casts only *to* generic, never the surrounding round trip — so that form emits an invalid
+# module ("Casts from private/local/global address space are allowed only to generic") on every
+# SPIR-V backend, including oneAPI and Metal. NVPTX tolerates it, which is why it goes unnoticed
+# on CUDA. Keeping the address space in the pointer type avoids the cast entirely.
+@inline _same_as_ptr(::Type{U}, p::Core.LLVMPtr{T, AS}) where {U, T, AS} =
+    reinterpret(Core.LLVMPtr{U, AS}, p)
+@inline _same_as_ptr(::Type{U}, p::Ptr) where {U} = reinterpret(Ptr{U}, p)
+
 # Device-scope relaxed (L1-bypassing) atomic load/store of a[i], reinterpreting through a
 # same-width unsigned integer so float element types are supported. The `U === Nothing`
 # branch is resolved at compile time.
@@ -201,7 +211,7 @@ end
     if U === Nothing
         return a[i]
     else
-        p = reinterpret(Ptr{U}, pointer(a, i))
+        p = _same_as_ptr(U, pointer(a, i))
         return reinterpret(eltype(a), UnsafeAtomics.load(p, UnsafeAtomics.monotonic))
     end
 end
@@ -211,7 +221,7 @@ end
     if U === Nothing
         a[i] = x
     else
-        p = reinterpret(Ptr{U}, pointer(a, i))
+        p = _same_as_ptr(U, pointer(a, i))
         UnsafeAtomics.store!(p, reinterpret(U, x), UnsafeAtomics.monotonic)
     end
     return nothing
@@ -378,7 +388,10 @@ function accumulate_1d_gpu!(
     aggregates = nothing
 
     if isnothing(temp_flags)
-        flags = similar(v, UInt8, num_blocks)
+        # 32-bit, not 8-bit: SPIR-V/OpenCL atomics are defined only for 32- and 64-bit
+        # types, so a UInt8 flag makes the decoupled-lookback kernels fail to build on
+        # oneAPI (and would on Metal). The wider flag costs 3 bytes per block.
+        flags = similar(v, UInt32, num_blocks)
     else
         @argcheck eltype(temp_flags) <: Integer
         @argcheck length(temp_flags) >= num_blocks

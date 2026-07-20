@@ -539,7 +539,7 @@ end
         found = false
         b = iblock - 1
         while b >= 0
-            if _load_relaxed(flags, b * 256 + d + 1) == UInt8(1)
+            if _load_relaxed(flags, b * 256 + d + 1) == UInt32(1)
                 _decoupled_fence()                                     # value load after flag load
                 excl = _load_relaxed(incl, b * 256 + d + 1) + excl_partial
                 found = true
@@ -555,7 +555,7 @@ end
 
         _store_relaxed!(incl, iblock * 256 + d + 1, excl + local_count)   # publish inclusive prefix
         _decoupled_fence()                                                 # value before flag
-        _store_relaxed!(flags, iblock * 256 + d + 1, UInt8(1))
+        _store_relaxed!(flags, iblock * 256 + d + 1, UInt32(1))
         s_gbase[d + 1] = excl
         d += NI
     end
@@ -652,7 +652,7 @@ function _radix_sort!(
         digit_total = similar(v, UInt32, Int(_RS_SIZE))
         digit_base  = similar(v, UInt32, Int(_RS_SIZE))
         incl        = similar(v, UInt32, Int(_RS_SIZE) * num_blocks)
-        flags       = similar(v, UInt8,  Int(_RS_SIZE) * num_blocks)
+        flags       = similar(v, UInt32, Int(_RS_SIZE) * num_blocks)
     else
         # Single histogram buffer; no need to zero before each pass — the histogram kernel
         # zero-initializes its own shared-memory histogram and writes directly here.
@@ -722,7 +722,7 @@ function _radix_sort!(
             # digit_total accumulates via atomics and flags gates the look-back, so both start
             # zeroed each pass; incl is written before it is read.
             fill!(digit_total, UInt32(0))
-            fill!(flags, UInt8(0))
+            fill!(flags, UInt32(0))
             hist_os_kern!(hist, digit_total, p1, shift32, descending; ndrange)
             dbase_kern!(digit_base, digit_total; ndrange=(block_size,))
             os_kern!(p2, p1, hist, digit_base, incl, flags, shift32, descending; ndrange)
