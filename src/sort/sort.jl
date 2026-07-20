@@ -34,11 +34,10 @@ scatter via a non-spinning decoupled look-back, cutting the kernel launches per 
 cross-block dependency for fewer dispatches, so it is expected to help only on
 dispatch-bound backends (Metal, oneAPI) and to lose on CUDA, where launches are cheap.
 It requires backend atomics support and `block_size % 32 == 0`, and silently falls back to the
-default three-kernel path otherwise. The default can also be flipped for a whole session with
-the `AK_RADIX_ONESWEEP` environment variable.
+default three-kernel path otherwise.
 """
 Base.@kwdef struct RadixSort <: SortAlgorithm
-    onesweep::Bool = haskey(ENV, "AK_RADIX_ONESWEEP")
+    onesweep::Bool = false
 end
 
 """
@@ -92,7 +91,7 @@ faster if it is a more compute-heavy operation to hide memory latency - that inc
 
 ## GPU
 GPU settings: use `block_size` threads per block to sort the array. When `block_size` is left as
-`nothing` (the default), each GPU algorithm picks its own tuned value (256 for merge sort, 512 for
+`nothing` (the default), each GPU algorithm picks its own tuned value (256 for both merge sort and
 radix sort); pass an explicit `block_size` to override.
 
 ## Algorithm choice

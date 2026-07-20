@@ -28,7 +28,14 @@ import Atomix
 
 const _RS_BITS  = UInt32(8)
 const _RS_SIZE  = UInt32(256)   # 2^_RS_BITS
-const _RS_CHUNK = 32            # chunked-scatter chunk width (smaller = cheaper rank; 32 best measured)
+# Chunk width for the scatter's stable rank.  This is a pure tuning constant, not a hardware
+# requirement: the rank is computed with shared-memory atomics and an explicit intra-chunk scan,
+# never with sub-group intrinsics, so any width that divides block_size is correct.  32 was the
+# best measured value on NVIDIA and AMD; it has not been re-tuned for wavefront 64 (AMD) or
+# sub-group 16 (Intel), where a matching width may do better.  Once the KernelAbstractions 0.10
+# sub-group interface is the compat floor, `KernelInterface.get_sub_group_size()` would let this
+# be chosen per device instead of fixed — it cannot be used while 0.9 is still supported.
+const _RS_CHUNK = 32
 
 # Conservative per-block shared-memory budget.  48 KiB is the largest static allocation every
 # backend we target accepts without opting into a larger carveout, so it is used as a portable
@@ -395,7 +402,7 @@ end
 # ─── Onesweep (experimental) ─────────────────────────────────────────────────
 # Fuses the global prefix-sum into the scatter, cutting the per-pass kernel launches from
 # hist + accumulate!(scan) + scatter down to hist + tiny-scan + scatter — a win on
-# dispatch-bound backends (e.g. Metal).  Opt-in via ENV["AK_RADIX_ONESWEEP"]; needs shared-
+# dispatch-bound backends (e.g. Metal).  Opt-in via RadixSort(onesweep=true); needs shared-
 # and global-memory atomics plus a device-scope fence, so the driver only selects it where
 # the backend reports atomics support.  Per pass:
 #   1. _radix_hist_os!  — per-tile digit histogram AND global per-digit totals, one pass.
@@ -616,7 +623,7 @@ function _radix_sort!(
     order::Base.Order.Ordering=Base.Forward,
     block_size::Int=256,
     temp::Union{Nothing, AbstractArray}=nothing,
-    onesweep::Bool=haskey(ENV, "AK_RADIX_ONESWEEP"),
+    onesweep::Bool=false,
 ) where T
 
     if !_rs_supported(T) || lt !== isless || by !== identity
@@ -635,9 +642,8 @@ function _radix_sort!(
 
     # Experimental onesweep path (opt-in): fuses the prefix-sum into the scatter.  Needs
     # shared/global atomics + a device-scope fence, and block_size a multiple of the chunk.
-    # Requested via the `onesweep` keyword (default: the AK_RADIX_ONESWEEP env var, which lets
-    # a whole test/benchmark run be flipped over without touching call sites); silently
-    # declined where the backend cannot support it.
+    # Requested via the `onesweep` keyword; silently declined where the backend cannot
+    # support it.
     has_atomics = KernelAbstractions.supports_atomics(backend)
     onesweep = onesweep && has_atomics && block_size % _RS_CHUNK == 0
 
@@ -690,12 +696,9 @@ function _radix_sort!(
         # for large blocks with wide keys (e.g. block_size=1024 with 8-byte keys, where the
         # kernel fails to compile outright).  Estimate the requirement and fall back to the
         # portable broadcast scatter rather than emitting a kernel that cannot launch.
-        # AK_RADIX_NOCOALESCE selects the older direct-write kernel for A/B measurement.
         scat_kern! = if has_atomics && block_size % _RS_CHUNK == 0 &&
                         _rs_scatter_shmem(T, block_size) <= _RS_SHMEM_BUDGET
-            haskey(ENV, "AK_RADIX_NOCOALESCE") ?
-                _radix_scatter_chunked!(backend, block_size) :
-                _radix_scatter_coalesced!(backend, block_size)
+            _radix_scatter_coalesced!(backend, block_size)
         else
             _radix_scatter!(backend, block_size)
         end
