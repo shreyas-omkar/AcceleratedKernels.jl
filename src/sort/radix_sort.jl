@@ -42,6 +42,24 @@ const _RS_CHUNK = 32
 # ceiling rather than querying a device limit KernelAbstractions cannot yet report.
 const _RS_SHMEM_BUDGET = 48 * 1024
 
+# Smallest input for which radix sort is actually worth using, by key width.
+#
+# A radix pass moves the whole array and costs a fixed three kernel launches (histogram,
+# global scan, scatter), so a sort of n elements pays 3 * 8 * sizeof(T) launches regardless of
+# n. Below the threshold those launches dominate and merge sort wins outright — by 3.6x at
+# n=10_000 on an RTX 3060 and by the same margin on Intel Iris Xe, where dispatch is far more
+# expensive. Deferring to merge_sort! there is the single largest win available on
+# dispatch-bound backends, because it removes all ~23 launches rather than shaving a few.
+#
+# 8-byte keys need eight passes instead of four, and on every device measured (RTX 3060,
+# RTX 5080, Iris Xe) that never amortises: merge sort was faster at *all* sizes tested, from
+# n=10_000 (5.8x) through n=64_000_000 (1.8x). They therefore always defer.
+#
+# Measured crossovers on an RTX 3060: Float32 ~262k, Int32 ~524k, Int64 none. The 4-byte
+# threshold is set at the Float32 crossover; between there and the Int32 crossover Int32 radix
+# is at most 1.17x off merge, which is a smaller error than triggering too late.
+@inline _rs_min_n(::Type{T}) where {T} = sizeof(T) <= 4 ? 262_144 : typemax(Int)
+
 # Shared memory the chunked / coalesced scatter kernels need for a given key type and block
 # size.  Dominated by the per-chunk sub-histogram (_RS_SIZE entries per chunk).
 @inline function _rs_scatter_shmem(::Type{T}, block_size::Integer) where {T}
@@ -663,7 +681,9 @@ function _radix_sort!(
     onesweep::Bool=false,
 ) where T
 
-    if !_rs_supported(T) || lt !== isless || by !== identity
+    # Defer to merge sort for unsupported types / comparators, and for inputs too small (or key
+    # types too wide) for the per-pass launches to amortise — see `_rs_min_n`.
+    if !_rs_supported(T) || lt !== isless || by !== identity || length(v) < _rs_min_n(T)
         return merge_sort!(v, backend; lt, by, rev, order, block_size, temp)
     end
 

@@ -28,6 +28,11 @@ Use GPU radix sort for `sort!` and `sort`. A stable LSD radix sort (8-bit digits
 and skips passes automatically for small-range or structured data. Defaults to `block_size=256`.
 This algorithm does not support `sortperm!`.
 
+Radix pays a fixed three kernel launches per 8-bit digit, so it only becomes worthwhile once
+the input is large enough to amortise them: below roughly 262k elements it defers to
+[`merge_sort!`](@ref) automatically, and 8-byte keys (which need eight passes rather than
+four) always defer, since merge sort was faster at every size measured on NVIDIA and Intel.
+
 `onesweep=true` selects an **experimental** variant that fuses the global prefix-sum into the
 scatter via a non-spinning decoupled look-back, cutting the kernel launches per pass from three
 (histogram, scan, scatter) down to two. This trades more device-memory traffic and a
