@@ -175,10 +175,14 @@ end
 #   2. Ordering. A device-scope memory fence must separate the aggregate store from the
 #      flag store (producer), and the flag load from the aggregate load (consumer).
 #
-# `_decoupled_fence()` is that device-scope fence. The generic definition uses an
-# acquire-release atomic fence, which lowers on OpenCL/SPIR-V, Metal, oneAPI and AMDGPU.
-# On CUDA the NVPTX backend does not select scoped atomic fences (only `monotonic` does),
-# so the CUDA package extension overrides this with `CUDA.threadfence()` (`membar.gl`).
+# `_decoupled_fence()` is that fence. The generic definition is an acquire-release atomic
+# fence, which lowers on every backend we can currently build for — including NVPTX, where
+# it emits `fence.acq_rel.sys`. That is *system* scope: correct, but stronger (and slower)
+# than the device scope the protocol actually needs, since no host or peer-GPU agent
+# participates. Backends that can express the narrower scope may override this; the CUDA
+# extension does so with `CUDA.threadfence()` (`membar.gl`, device scope), which measures
+# ~1.5x faster on the lookback than the system-scope fence. The override is therefore a
+# performance narrowing only — correctness does not depend on it.
 @inline _decoupled_fence() = UnsafeAtomics.fence(UnsafeAtomics.acq_rel)
 
 # Unsigned integer type with the same width as T, or `Nothing` if T is not a 1/2/4/8-byte
