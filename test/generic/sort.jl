@@ -973,4 +973,29 @@ end
                                             prefer_threads, dims=1, alg=AK.RadixSort())
     end
 end
+
+@testset "auto_sort_alg" begin
+    fwd = Base.Order.Forward
+    rev = Base.Order.Reverse
+    # picks BitonicSort only where applicable and small
+    @test AK._default_gpu_sort_alg(array_from_host(rand(Float32, 100)), fwd) isa AK.BitonicSort
+    @test AK._default_gpu_sort_alg(array_from_host(rand(Int32, AK._AUTO_BITONIC_MAX)), rev) isa AK.BitonicSort
+    @test AK._default_gpu_sort_alg(array_from_host(rand(Float32, AK._AUTO_BITONIC_MAX + 1)), fwd) isa AK.MergeSort
+    @test AK._default_gpu_sort_alg(array_from_host(rand(Int16, 100)), fwd) isa AK.MergeSort          # unsupported eltype
+    @test AK._default_gpu_sort_alg(array_from_host(rand(Float32, 8, 8)), fwd) isa AK.MergeSort       # not a vector
+    byord = Base.Order.ord(isless, abs, false, Base.Order.Forward)
+    @test AK._default_gpu_sort_alg(array_from_host(rand(Float32, 100)), byord) isa AK.MergeSort      # custom ordering
+
+    # default sort! (no alg) is correct across the bitonic/merge crossover
+    for n in (1, 2, 64, 1000, AK._AUTO_BITONIC_MAX, AK._AUTO_BITONIC_MAX + 1, 10_000)
+        for T in (Int32, UInt32, Float32)
+            vh = rand(T, n)
+            @test Array(AK.sort(array_from_host(vh); prefer_threads)) == sort(vh)
+            @test Array(AK.sort(array_from_host(vh); prefer_threads, rev=true)) == sort(vh; rev=true)
+        end
+    end
+    # a small vector with a custom comparator must fall back to merge and still be correct
+    vh = rand(Float32, 500)
+    @test Array(AK.sort(array_from_host(vh); prefer_threads, by=abs)) == sort(vh; by=abs)
+end
 end

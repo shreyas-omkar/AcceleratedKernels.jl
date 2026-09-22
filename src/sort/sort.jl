@@ -120,10 +120,14 @@ algorithm take precedence over this keyword, then backend defaults. `items_per_t
 `RadixSort` and defaults to 2.
 
 ## Algorithm choice
-By default, `sort!` uses sample sort on CPU backends and merge sort on GPU
-backends. Pass `alg=SampleSort()` for the CPU path, `alg=MergeSort()` for the GPU merge-sort path,
-or `alg=RadixSort()` to opt into GPU radix sorting. `RadixSort()` supports 32-bit and 64-bit
-integers and floats with default `lt`/`by`.
+By default, `sort!` uses sample sort on CPU backends. On GPU backends it auto-selects based on the
+input size: [`BitonicSort`](@ref) for a small vector of a supported eltype with plain forward or
+reverse ordering (it sorts entirely in shared memory and wins at that size on every backend), and
+[`MergeSort`](@ref) otherwise. The threshold is a conservative, device-independent value.
+
+Passing `alg` explicitly bypasses the auto-selection: `alg=SampleSort()` for the CPU path,
+`alg=MergeSort()` or `alg=BitonicSort()` for those GPU paths, or `alg=RadixSort()` to opt into GPU
+radix sorting. `RadixSort()` supports 32-bit and 64-bit integers and floats with default `lt`/`by`.
 
 For both CPU and GPU backends, the `temp` argument can be used to reuse a temporary buffer of the
 same size as `v` to store the sorted output.
@@ -156,6 +160,25 @@ function sort!(
 end
 
 
+# Largest vector length for which the auto-selected algorithm uses BitonicSort. A small vector sorts
+# entirely in one workgroup's shared memory, which beats MergeSort's multi-block path below this size
+# on every backend we profiled (NVIDIA, AMD, Metal). The value is deliberately conservative and
+# device-independent; a package extension can refine it per device later.
+const _AUTO_BITONIC_MAX = 2048
+
+# Algorithm used when the caller does not pass `alg` on a GPU backend. BitonicSort is picked only
+# where it is both applicable (a vector of a supported eltype, plain forward/reverse ordering) and
+# faster (small inputs); MergeSort stays the default everywhere else. Passing `alg` explicitly skips
+# this selection entirely.
+@inline function _default_gpu_sort_alg(v::AbstractArray, ordering::Base.Order.Ordering)
+    if v isa AbstractVector && length(v) <= _AUTO_BITONIC_MAX && _bs_supported(eltype(v)) &&
+       (ordering === Base.Order.Forward || ordering === Base.Order.Reverse)
+        return BitonicSort()
+    end
+    return MergeSort()
+end
+
+
 function _sort_impl!(
     v::AbstractArray, backend::Backend;
 
@@ -185,7 +208,7 @@ function _sort_impl!(
     end
 
     if use_gpu_algorithm(backend, prefer_threads)
-        alg = isnothing(alg) ? MergeSort() : alg
+        alg = isnothing(alg) ? _default_gpu_sort_alg(v, Base.Order.ord(lt, by, rev, order)) : alg
         if alg isa MergeSort
             merge_sort!(
                 v, backend;
