@@ -973,4 +973,17 @@ end
                                             prefer_threads, dims=1, alg=AK.RadixSort())
     end
 end
+
+@testset "segmented_radix_dims" begin
+    # slices larger than the single-workgroup bitonic ceiling take the segmented-radix path
+    for T in (Int32, UInt32, Float32, Int64, UInt64)
+        for (L, S) in ((16384, 8), (65536, 4), (300_000, 2))
+            vh = T <: AbstractFloat ? rand(T, L, S) : rand(T(1):T(1000), L, S)
+            @test Array(AK.sort(array_from_host(vh); prefer_threads, dims=1)) == sort(vh; dims=1)
+            @test Array(AK.sort(array_from_host(vh); prefer_threads, dims=1, rev=true)) == sort(vh; dims=1, rev=true)
+        end
+    end
+    vh = rand(Float32, 20_000, 3, 2)   # N-D along dim 1
+    @test Array(AK.sort(array_from_host(vh); prefer_threads, dims=1)) == sort(vh; dims=1)
+end
 end

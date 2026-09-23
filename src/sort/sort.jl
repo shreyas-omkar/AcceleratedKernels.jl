@@ -5,6 +5,7 @@ include("merge_sortperm.jl")
 include("cpu_sample_sort.jl")
 include("radix_sort.jl")
 include("bitonic_sort.jl")
+include("segmented_radix_sort.jl")
 
 
 # Available sorting algorithms
@@ -100,8 +101,9 @@ struct SampleSort <: SortAlgorithm end
 
 Sorts the array `v` in-place using the specified backend. The `lt`, `by`, `rev`, and `order`
 arguments are the same as for `Base.sort`. Pass an integer `dims` to sort each 1-D slice along that
-dimension independently, matching `Base.sort(A; dims)`; this uses [`BitonicSort`](@ref) and requires
-each slice to fit a single workgroup's shared memory.
+dimension independently, matching `Base.sort(A; dims)`. Each slice that fits a single workgroup's
+shared memory is sorted with [`BitonicSort`](@ref); larger slices along `dim == 1` use a segmented
+radix sort.
 
 ## CPU
 CPU settings: use at most `max_tasks` threads to sort the array such that at least `min_elems`
@@ -253,13 +255,19 @@ function _sort_dims_impl!(
         (isnothing(alg) || alg isa BitonicSort) ||
             throw(ArgumentError("sort along `dims` is only supported by BitonicSort, got $(typeof(alg))"))
         _bs_supported(T) ||
-            throw(ArgumentError("BitonicSort is not supported for eltype \"$T\""))
+            throw(ArgumentError("sort along `dims` is not supported for eltype \"$T\""))
         ordering = Base.Order.ord(lt, by, rev, order)
         ordering === Base.Order.Forward || ordering === Base.Order.Reverse ||
-            throw(ArgumentError("BitonicSort only supports forward or reverse ordering"))
-        bs_block = (alg isa BitonicSort && !isnothing(alg.block_size)) ? alg.block_size : block_size
-        _bitonic_sort_dims!(v, backend, dim; descending=ordering === Base.Order.Reverse,
-                            block_size=bs_block)
+            throw(ArgumentError("sort along `dims` only supports forward or reverse ordering"))
+        descending = ordering === Base.Order.Reverse
+        # A slice sorts in one workgroup with bitonic; above that budget, `dim == 1` (contiguous
+        # segments) uses segmented radix. `alg=BitonicSort()` forces the bitonic path either way.
+        if !(alg isa BitonicSort) && dim == 1 && size(v, dim) > _seg_bitonic_ceiling(T, backend)
+            _segmented_radix_sort_dims!(v, backend; descending)
+        else
+            bs_block = (alg isa BitonicSort && !isnothing(alg.block_size)) ? alg.block_size : block_size
+            _bitonic_sort_dims!(v, backend, dim; descending, block_size=bs_block)
+        end
     else
         ordering = Base.Order.ord(lt, by, rev, order)
         other_dims = Tuple(d for d in 1:N if d != dim)          # slices vary only along `dim`
